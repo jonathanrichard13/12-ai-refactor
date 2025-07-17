@@ -5,7 +5,7 @@ import Navbar from "@/components/Navbar";
 import { useAuth } from "@/hooks/useAuth";
 
 // Bad practice: global variable for API URL
-const API_URL = "http://localhost:3000/api/users";
+const API_URL = "http://localhost:3001/api/users";
 
 // Bad practice: no proper TypeScript interfaces
 interface UserData {
@@ -31,7 +31,7 @@ export default function UsersPageComponent() {
   const [loadingState, setLoadingState] = useState<boolean>(true);
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [searchTerm, setSearchTerm] = useState<string>("");
-  const [sortBy, setSortBy] = useState<string>("createdAt");
+  const [sortBy, setSortBy] = useState<string>("created_at");
   const [divisionFilter, setDivisionFilter] = useState<string>("all");
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [itemsPerPage, setItemsPerPage] = useState<number>(20);
@@ -55,22 +55,35 @@ export default function UsersPageComponent() {
 
     try {
       // Bad practice: no timeout, no retry logic
-      const url =
-        divisionFilter !== "all"
-          ? `${API_URL}?division=${divisionFilter}`
-          : API_URL;
+      const url = new URL(`${API_URL}`);
+      if (divisionFilter !== "all") {
+        url.searchParams.append('division', divisionFilter);
+      }
+      url.searchParams.append('page', currentPage.toString());
+      url.searchParams.append('limit', itemsPerPage.toString());
+      if (searchTerm) {
+        url.searchParams.append('search', searchTerm);
+      }
+      if (sortBy) {
+        url.searchParams.append('sortBy', sortBy);
+      }
 
-      const response = await fetch(url);
+      const response = await fetch(url.toString());
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data = await response.json();
+      const result = await response.json();
 
-      // Bad practice: no validation of response data
-      setUsersData(data.users || []);
-      setTotalCount(data.total || 0);
+      // Fixed: Correctly handle the new API response structure
+      if (result.success) {
+        setUsersData(result.data || []);
+        setTotalCount(result.pagination?.totalCount || 0);
+      } else {
+        throw new Error(result.message || 'Failed to fetch users');
+      }
+      
       setLastFetchTime(new Date());
       setFetchCount((prev) => prev + 1);
     } catch (error) {
@@ -86,7 +99,7 @@ export default function UsersPageComponent() {
   // Bad practice: useEffect with no dependencies array optimization
   useEffect(() => {
     fetchUsersData();
-  }, [divisionFilter]);
+  }, [divisionFilter, currentPage, itemsPerPage, searchTerm, sortBy]);
 
   // Bad practice: inefficient filtering and sorting logic
   const getFilteredAndSortedUsers = () => {
@@ -432,10 +445,9 @@ export default function UsersPageComponent() {
                 width: "150px",
               }}
             >
-              <option value="createdAt">Created Date</option>
-              <option value="fullName">Full Name</option>
+              <option value="created_at">Created Date</option>
+              <option value="full_name">Full Name</option>
               <option value="username">Username</option>
-              <option value="division">Division</option>
             </select>
           </div>
 

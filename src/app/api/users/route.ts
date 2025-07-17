@@ -1,181 +1,180 @@
-import { NextResponse } from "next/server";
-import { executeQuery } from "@/lib/database";
+// Enhanced Users API with comprehensive error handling, validation, and performance optimization
+import { NextRequest, NextResponse } from "next/server";
+import { UserService, ValidationError, UserData, UserStats } from "@/lib/user-service";
+import { ResponseFormatter, parseQueryParams, RateLimiter } from "@/lib/response-formatter";
+import { DatabaseError } from "@/lib/database";
 
-export async function GET(request: Request) {
+// Helper function to get client identifier for rate limiting
+function getClientIdentifier(request: NextRequest): string {
+  // In production, use proper IP extraction considering proxies
+  const forwarded = request.headers.get('x-forwarded-for');
+  const realIp = request.headers.get('x-real-ip');
+  const ip = forwarded ? forwarded.split(',')[0] : realIp || 'unknown';
+  return ip;
+}
+
+export async function GET(request: NextRequest) {
+  const startTime = performance.now();
   console.time("Users API Execution");
+  
+  let requestId: string | undefined;
 
   try {
-    // Bad practice: extract query params manually without proper parsing
-    const url = new URL(request.url);
-    const divisionFilter = url.searchParams.get("division");
-
-    // Bad practice: extremely inefficient query with multiple joins, subqueries, and no pagination
-    let query = `
-      SELECT 
-        u.id,
-        u.username,
-        u.full_name,
-        u.birth_date,
-        u.bio,
-        u.long_bio,
-        u.profile_json,
-        u.address,
-        u.phone_number,
-        u.created_at,
-        u.updated_at,
-        a.email,
-        ur.role,
-        ud.division_name,
-        -- Bad practice: unnecessary subqueries for demo
-        (SELECT COUNT(*) FROM users) as total_users,
-        (SELECT COUNT(*) FROM users WHERE created_at > u.created_at) as newer_users,
-        (SELECT COUNT(*) FROM user_logs WHERE user_id = u.id) as log_count,
-        (SELECT COUNT(*) FROM user_roles WHERE user_id = u.id) as role_count,
-        (SELECT COUNT(*) FROM user_divisions WHERE user_id = u.id) as division_count,
-        -- Bad practice: more unnecessary subqueries
-        (SELECT COUNT(*) FROM user_logs WHERE action = 'login' AND user_id = u.id) as login_count,
-        (SELECT COUNT(*) FROM user_logs WHERE action = 'update_profile' AND user_id = u.id) as update_count,
-        -- Bad practice: complex nested subqueries
-        (SELECT COUNT(*) FROM user_logs ul 
-         WHERE ul.user_id = u.id 
-         AND ul.created_at > (SELECT MAX(created_at) FROM user_logs WHERE user_id = u.id) - INTERVAL '30 days') as recent_logs,
-        -- Bad practice: unnecessary string operations
-        CONCAT(u.full_name, ' (', COALESCE(ur.role, 'no role'), ')') as display_name,
-        CASE 
-          WHEN u.bio IS NULL THEN 'No bio available'
-          WHEN u.bio = '' THEN 'Empty bio'
-          ELSE u.bio
-        END as bio_display,
-        -- Bad practice: complex JSON operations (fixed for PostgreSQL compatibility)
-        CASE 
-          WHEN u.profile_json IS NOT NULL THEN 
-            CASE 
-              WHEN u.profile_json->'social_media' IS NOT NULL THEN
-                CASE 
-                  WHEN u.profile_json->'social_media'->>'instagram' IS NOT NULL THEN
-                    u.profile_json->'social_media'->>'instagram'
-                  ELSE 'No Instagram'
-                END
-              ELSE 'No social media'
-            END
-          ELSE 'No profile data'
-        END as instagram_handle
-      FROM users u
-      LEFT JOIN auth a ON u.auth_id = a.id
-      LEFT JOIN user_roles ur ON u.id = ur.user_id
-      LEFT JOIN user_divisions ud ON u.id = ud.user_id
-      -- Bad practice: unnecessary cross join for demo
-      CROSS JOIN (SELECT 1 as dummy) d
-    `;
-
-    // Bad practice: inefficient filtering without proper indexing
-    if (divisionFilter && divisionFilter !== "all") {
-      query += ` WHERE ud.division_name = '${divisionFilter}'`;
+    // Generate request ID for tracking
+    requestId = `users_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    
+    // Rate limiting check
+    const clientId = getClientIdentifier(request);
+    const rateLimit = RateLimiter.checkRateLimit(clientId, 100, 60000); // 100 requests per minute
+    
+    if (!rateLimit.allowed) {
+      console.timeEnd("Users API Execution");
+      return ResponseFormatter.error(
+        'Rate limit exceeded. Please try again later.',
+        429,
+        'RATE_LIMIT_EXCEEDED',
+        {
+          resetTime: new Date(rateLimit.resetTime).toISOString(),
+          remaining: rateLimit.remaining
+        },
+        requestId
+      );
     }
 
-    query += ` ORDER BY u.created_at DESC`;
+    // Parse and validate query parameters
+    const queryParams = parseQueryParams(request);
+    const { division, page, limit, includeStats, search, sortBy, sortOrder } = queryParams;
 
-    const result = await executeQuery(query);
+    // Log request for monitoring (in development)
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`🔍 Users API Request ${requestId}:`, {
+        division,
+        page,
+        limit,
+        includeStats,
+        search: search ? `"${search}"` : undefined,
+        sortBy,
+        sortOrder,
+        clientId
+      });
+    }
 
-    // Bad practice: processing all data in memory with complex transformations
-    const users = result.rows.map((user: any) => {
-      // Bad practice: complex data processing in application layer
-      // PostgreSQL JSON type already returns object, no need to parse
-      const profileJson = user.profile_json || null;
-      const socialMedia = profileJson?.social_media || {};
-      const preferences = profileJson?.preferences || {};
-      const skills = profileJson?.skills || [];
-      const interests = profileJson?.interests || [];
+    // Build user service options
+    const userOptions = {
+      division,
+      page,
+      limit,
+      search,
+      sortBy: sortBy as 'created_at' | 'username' | 'full_name' | undefined,
+      sortOrder,
+    };
 
-      // Bad practice: unnecessary calculations
-      const daysSinceCreated = Math.floor(
-        (Date.now() - new Date(user.created_at).getTime()) /
-          (1000 * 60 * 60 * 24)
-      );
-      const isActive = user.log_count > 5;
-      const isSenior = user.role === "admin" || user.role === "moderator";
+    // Execute database operations in parallel for optimal performance
+    const [users, totalCount, stats]: [UserData[], number, UserStats | null] = await Promise.all([
+      UserService.getUsers(userOptions),
+      UserService.getTotalCount(division, search),
+      includeStats ? UserService.getUserStats(division) : Promise.resolve(null),
+    ]);
 
-      return {
-        id: user.id,
-        username: user.username,
-        fullName: user.full_name,
-        email: user.email,
-        birthDate: user.birth_date,
-        bio: user.bio,
-        longBio: user.long_bio,
-        profileJson: profileJson,
-        address: user.address,
-        phoneNumber: user.phone_number,
-        createdAt: user.created_at,
-        updatedAt: user.updated_at,
-        role: user.role,
-        division: user.division_name,
-        displayName: user.display_name,
-        bioDisplay: user.bio_display,
-        instagramHandle: user.instagram_handle,
-        // Bad practice: calculated fields that could be computed in SQL
-        totalUsers: user.total_users,
-        newerUsers: user.newer_users,
-        logCount: user.log_count,
-        roleCount: user.role_count,
-        divisionCount: user.division_count,
-        loginCount: user.login_count,
-        updateCount: user.update_count,
-        recentLogs: user.recent_logs,
-        // Bad practice: application-level calculations
-        daysSinceCreated,
-        isActive,
-        isSenior,
-        socialMedia,
-        preferences,
-        skills,
-        interests,
-        // Bad practice: redundant data
-        hasProfile: !!user.profile_json,
-        hasBio: !!user.bio,
-        hasAddress: !!user.address,
-        hasPhone: !!user.phone_number,
-        // Bad practice: more redundant calculations
-        profileCompleteness:
-          ([
-            !!user.bio,
-            !!user.address,
-            !!user.phone_number,
-            !!user.profile_json,
-          ].filter(Boolean).length /
-            4) *
-          100,
+    // Create pagination metadata
+    const pagination = ResponseFormatter.createPagination(page, limit, totalCount);
+
+    // Prepare response metadata
+    const meta: Record<string, unknown> = {
+      filteredBy: division,
+      searchTerm: search,
+      sortBy: sortBy || 'created_at',
+      sortOrder,
+      executionTime: `${(performance.now() - startTime).toFixed(2)}ms`,
+      rateLimit: {
+        remaining: rateLimit.remaining,
+        resetTime: new Date(rateLimit.resetTime).toISOString()
+      }
+    };
+
+    // Add statistics if requested
+    if (stats) {
+      meta.statistics = {
+        totalUsers: stats.totalUsers,
+        activeUsers: stats.activeUsers,
+        usersByDivision: stats.usersByDivision,
+        usersByRole: stats.usersByRole,
       };
-    });
-
-    // Bad practice: additional processing after mapping
-    const activeUsers = users.filter((u) => u.isActive);
-    const seniorUsers = users.filter((u) => u.isSenior);
-    const usersWithCompleteProfiles = users.filter(
-      (u) => u.profileCompleteness > 75
-    );
-    const usersByDivision = users.reduce((acc, user) => {
-      acc[user.division] = (acc[user.division] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
+    }
 
     console.timeEnd("Users API Execution");
-    return NextResponse.json({
+    
+    // Log successful response (in development)
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`✅ Users API Response ${requestId}:`, {
+        userCount: users.length,
+        totalCount,
+        page,
+        hasNext: pagination.hasNext,
+        executionTime: meta.executionTime
+      });
+    }
+
+    return ResponseFormatter.success(
       users,
-      total: users.length,
-      activeUsers: activeUsers.length,
-      seniorUsers: seniorUsers.length,
-      usersWithCompleteProfiles: usersWithCompleteProfiles.length,
-      usersByDivision,
-      filteredBy: divisionFilter || "all",
-      message: "Users retrieved successfully",
-    });
+      "Users retrieved successfully",
+      pagination,
+      meta,
+      requestId
+    );
+
   } catch (error) {
-    console.error("Users API error:", error);
     console.timeEnd("Users API Execution");
-    return NextResponse.json(
-      { message: "Internal server error." },
-      { status: 500 }
+    
+    // Enhanced error handling with specific error types
+    if (error instanceof ValidationError) {
+      console.warn(`⚠️  Validation error in Users API ${requestId}:`, {
+        field: error.field,
+        message: error.message
+      });
+      
+      return ResponseFormatter.validationError(
+        error.message,
+        error.field,
+        'Invalid value',
+        requestId
+      );
+    }
+
+    if (error instanceof DatabaseError) {
+      console.error(`❌ Database error in Users API ${requestId}:`, {
+        message: error.message,
+        originalError: error.originalError.message,
+        query: error.query?.substring(0, 100)
+      });
+      
+      return ResponseFormatter.error(
+        "Database operation failed",
+        500,
+        'DATABASE_ERROR',
+        {
+          message: error.message,
+          // Don't expose sensitive database details in production
+          ...(process.env.NODE_ENV === 'development' && {
+            originalError: error.originalError.message
+          })
+        },
+        requestId
+      );
+    }
+
+    // Generic error handling
+    console.error(`❌ Unexpected error in Users API ${requestId}:`, {
+      error: error instanceof Error ? error.message : error,
+      stack: error instanceof Error ? error.stack : undefined
+    });
+
+    return ResponseFormatter.error(
+      "An unexpected error occurred",
+      500,
+      'INTERNAL_SERVER_ERROR',
+      undefined,
+      requestId
     );
   }
 }
